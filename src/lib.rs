@@ -75,37 +75,34 @@ impl ClusterState {
         self.max_running.load(Ordering::Relaxed)
     }
 
+    /// Free slots. `running` can legitimately exceed `max_running` after a cap
+    /// cut (running queries are not revoked), so this saturates at zero (INC-2).
     fn available(&self) -> u64 {
-        self.max_running() - self.running()
+        self.max_running().saturating_sub(self.running())
     }
 
+    /// Take one slot if the cluster is under its cap.
+    ///
+    /// The check and the increment are one atomic read-modify-write, so two
+    /// callers can never both take the last slot, and a concurrent release can
+    /// never be overwritten (INC-1).
     fn try_increment(&self) -> bool {
-        let current = self.running.load(Ordering::Relaxed);
-        if current >= self.max_running() {
-            return false;
-        }
-        self.running.store(current + 1, Ordering::Relaxed);
-        true
+        self.running
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < self.max_running()).then_some(current + 1)
+            })
+            .is_ok()
     }
 
+    /// Return one slot. Never wraps below zero, so a counter that was corrected
+    /// downwards (e.g. by `reconcile`) cannot wedge the cluster (INC-1).
     fn decrement(&self) {
-        self.running.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .running
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            });
     }
-}
-
-#[derive(Debug, Clone)]
-struct Candidate {
-    name: String,
-    available: u64,
-}
-
-/// Least-loaded selection: the candidate with the most free slots wins.
-fn pick(candidates: &[Candidate]) -> Option<usize> {
-    candidates
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, c)| c.available)
-        .map(|(i, _)| i)
 }
 
 pub struct ClusterPool {
@@ -132,41 +129,32 @@ impl ClusterPool {
     }
 
     /// Admit one query to the least-loaded cluster of `group`, or fail fast with `Busy`.
+    ///
+    /// Clusters are tried in order of free slots, most first. The snapshot only
+    /// orders the attempts; the atomic increment decides admission. `Busy` is
+    /// returned only after every cluster in the group refused (INC-2, INC-3).
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
         let clusters = self.clusters(group).ok_or(AcquireError::UnknownGroup)?;
 
-        let candidates: Vec<Candidate> = clusters
-            .iter()
-            .map(|c| Candidate {
-                name: c.name.clone(),
-                available: c.available(),
-            })
-            .filter(|c| c.available > 0)
-            .collect();
+        let mut order: Vec<(u64, &Arc<ClusterState>)> =
+            clusters.iter().map(|c| (c.available(), c)).collect();
+        order.sort_by_key(|&(available, _)| std::cmp::Reverse(available));
 
-        let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
-        let name = candidates[chosen].name.clone();
-        let state = clusters
-            .iter()
-            .find(|c| c.name == name)
-            .ok_or(AcquireError::Busy)?;
+        for (_, state) in order {
+            if state.try_increment() {
+                *self
+                    .admissions
+                    .lock()
+                    .unwrap()
+                    .entry(format!("{group}/{}", state.name))
+                    .or_insert(0) += 1;
 
-        if !state.try_increment() {
-            return Err(AcquireError::Busy);
+                return Ok(Permit {
+                    state: Arc::clone(state),
+                });
+            }
         }
-
-        *self
-            .admissions
-            .lock()
-            .unwrap()
-            .entry(format!("{group}/{name}"))
-            .or_insert(0) += 1;
-
-        Ok(Permit {
-            pool: Arc::clone(self),
-            group: group.to_string(),
-            cluster: name,
-        })
+        Err(AcquireError::Busy)
     }
 
     /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.
@@ -177,12 +165,6 @@ impl ClusterPool {
     ) -> Result<Permit, AcquireError> {
         let _ = (group, wait);
         todo!("Part 3")
-    }
-
-    fn release(&self, group: &str, cluster: &str) {
-        if let Some(state) = self.find(group, cluster) {
-            state.decrement();
-        }
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -240,26 +222,37 @@ fn build_groups(config: &PoolConfig) -> HashMap<String, Vec<Arc<ClusterState>>> 
         .groups
         .iter()
         .map(|(group, clusters)| {
-            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
+            let states = clusters
+                .iter()
+                .map(|c| Arc::new(ClusterState::new(c)))
+                .collect();
             (group.clone(), states)
         })
         .collect()
 }
 
 /// Proof of admission. The holder may run one query on `cluster()`.
+///
+/// The slot is returned when the permit is dropped, including when the request
+/// future holding it is cancelled (INC-4). The permit holds the cluster state it
+/// was admitted to, so the release always reaches the counter it incremented.
 pub struct Permit {
-    pool: Arc<ClusterPool>,
-    group: String,
-    cluster: String,
+    state: Arc<ClusterState>,
 }
 
 impl Permit {
     pub fn cluster(&self) -> &str {
-        &self.cluster
+        &self.state.name
     }
 
-    /// Give the slot back once the query has finished.
+    /// Give the slot back once the query has finished. Same as dropping the permit.
     pub fn release(self) {
-        self.pool.release(&self.group, &self.cluster);
+        drop(self);
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.state.decrement();
     }
 }
