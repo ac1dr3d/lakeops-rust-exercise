@@ -183,7 +183,95 @@ has queries in flight, so a re-added cluster starts from zero while old queries 
 still be running. Draining a removed cluster (keep it in a "closed" state until its
 permits return) is the honest fix; I would want it before shipping.
 
-### INC-5: reconcile (not done)
+### INC-5: reconcile (fixed)
+
+Symptom: the job meant to correct drift made the counters *less* accurate under load.
+
+Root cause: `reconcile` stored the engine's answer after awaiting it.
+
+```rust
+let target = fetch().await;                                // slow: seconds, under load
+if let Some(state) = self.find(group, cluster) {
+    state.running.store(target, Ordering::Relaxed);        // overwrites everything since
+}
+```
+
+`fetch` can take a long time, and the gateway keeps admitting and releasing while it
+waits. The answer describes the engine at the moment it was asked, but `store`
+replaced the current value with it, discarding every admission and release in
+between. The more traffic, the more work there is to throw away, which is why it got
+worse exactly when it mattered. If the engine reported fewer queries than had been
+admitted since the snapshot, the next admits overshot the cap; if it reported more,
+the cluster looked busy with free slots.
+
+Fix: apply the engine's answer as a **delta**, captured before the fetch.
+
+```rust
+let Some(state) = self.find(group, cluster) else { return };
+let _serialized = state.reconcile.lock().await;   // one reconcile per cluster
+let before = state.running();                     // snapshot before asking
+let engine = fetch().await;
+state.correct(before, engine);                    // atomic: current + (engine - before)
+```
+
+`correct` is a single `try_update`: if the engine's count went up, it adds
+`engine - before` to whatever the counter is *now*; if it went down, it subtracts
+`saturating_sub`, so it can never wrap below zero. Traffic that happened during the
+fetch is preserved because only the difference is applied.
+
+Four further decisions in that function:
+
+- **The cluster is resolved before the fetch, not after.** A correction can only
+  land on the counter it was measured against, even if a reload removes or re-adds
+  that cluster while the engine is being asked. (Fixing this is why the test that
+  spans a reload passes.)
+- **One reconcile per cluster at a time** (`tokio::sync::Mutex` on the cluster
+  state). Two overlapping runs would each apply the same drift, so the second waits.
+  The lock is only taken by `reconcile`; `try_acquire` never touches it, so the hot
+  path is unaffected as the brief requires, and it is an async mutex, so waiting does
+  not block a runtime worker.
+- **Cancelling is harmless.** A timeout around a hung engine drops the future before
+  the adjustment; the counter is untouched and the lock is released.
+- **Saturation, not clamping.** The counter may end up above `max_running` (the
+  engine may be running queries this gateway did not admit, e.g. a second pod);
+  the cluster then takes no new queries until it drains. It cannot go below zero.
+
+What the guarantee still is *not*: the delta assumes `engine - before` stayed
+constant while the answer was in flight. It did not have to. Any change in the
+engine's own in-flight count during that window is still lost — a query that
+finished at the engine before it answered, or one the engine started for someone
+else, is not visible in either number. So the residual error is bounded by the
+number of queries the engine itself started or finished inside one fetch round trip,
+per reconcile, and under sustained load where queries finish faster than the fetch
+that error can persist rather than vanish. Removing it entirely needs the engine to
+report identifiably-versioned counts, or a read that is atomic with respect to the
+hot path, which the brief rules out for `try_acquire`. Being bounded and
+self-correcting on the next pass is the honest guarantee; "exact" is not available
+here.
+
+Tests: `tests/reconcile.rs`, 8 tests, all deterministic interleavings rather than
+sleeps. The engine is a pair of channels: the fetch closure signals the test the
+moment it is called, then waits for the test to send its answer, so the test's
+traffic lands exactly inside the fetch window.
+
+| Test | On the old code |
+|------|-----------------|
+| `reconcile_keeps_admissions_and_releases_made_during_the_fetch` | **fails** (12 vs 10) |
+| `reconcile_corrects_drift_while_traffic_continues` | **fails** (drift reapplied) |
+| `reconcile_still_corrects_drift_on_a_quiet_cluster` | passes (the easy case) |
+| `reconcile_counts_queries_the_engine_runs_for_someone_else` | passes |
+| `concurrent_reconciles_apply_the_correction_once` | passes; **fails if the per-cluster lock is removed** ("corrected twice") |
+| `cancelled_reconcile_changes_nothing_and_does_not_block_the_next` | passes |
+| `reconcile_for_an_unknown_cluster_is_a_no_op` | passes |
+| `reconcile_spanning_a_reload_never_touches_the_new_cluster` | passes |
+
+The last five are behaviour I chose and want to keep; they passed on the old code
+too, so I check them by breaking the new code on purpose (removing the lock, or the
+resolve-before-fetch ordering) rather than by comparing against the starter.
+
+Not done: a `loom` model. The correction is a single CAS on one word, so there is no
+interleaving left in it to model; the interesting interleaving is *between* two
+reconciles, which the per-cluster mutex serializes by construction.
 
 ## Before shipping, I would still want
 
