@@ -60,6 +60,8 @@ struct ClusterState {
     /// Queries ever admitted to this cluster (a Prometheus metric). Per cluster,
     /// so the hot path never touches a shared lock (see `admissions()`).
     admissions: AtomicU64,
+    /// Serializes `reconcile` for this cluster (INC-5). Never taken on the hot path.
+    reconcile: tokio::sync::Mutex<()>,
 }
 
 impl ClusterState {
@@ -69,6 +71,7 @@ impl ClusterState {
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
             admissions: AtomicU64::new(0),
+            reconcile: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -111,6 +114,21 @@ impl ClusterState {
             .running
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
+            });
+    }
+
+    /// Shift the counter by `engine - before`, saturating at zero.
+    ///
+    /// A read-modify-write, so admissions and releases racing with it are kept.
+    fn correct(&self, before: u64, engine: u64) {
+        let _ = self
+            .running
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if engine >= before {
+                    current.saturating_add(engine - before)
+                } else {
+                    current.saturating_sub(before - engine)
+                })
             });
     }
 }
@@ -289,15 +307,36 @@ impl ClusterPool {
 
     /// Bonus: correct a cluster's running counter against the engine's own count.
     /// `fetch` asks the engine how many queries it is running; it is slow.
+    ///
+    /// The engine's answer describes the moment it was asked, but the gateway kept
+    /// admitting and releasing while it waited. So this does not store the answer.
+    /// It snapshots the counter right before asking, and applies only the
+    /// difference, `engine - snapshot`, as one atomic adjustment once the answer
+    /// arrives. Everything that happened during the fetch is kept (INC-5).
+    ///
+    /// - At most one reconcile per cluster runs at a time. Two overlapping ones
+    ///   would each correct the same drift, so the second waits for the first.
+    /// - The cluster is resolved once, before the fetch. A correction always lands
+    ///   on the counter it was measured against, even if a reload happens meanwhile.
+    /// - Cancelling it (e.g. a timeout around a hung engine) changes nothing: the
+    ///   adjustment is applied in one synchronous step after the fetch returns.
+    /// - The counter saturates at zero and is allowed to exceed `max_running`, like
+    ///   after a cap cut: the cluster just takes no new queries until it drains.
+    ///
+    /// See NOTES.md (INC-5) for the error that remains and why it is bounded.
     pub async fn reconcile<F, Fut>(&self, group: &str, cluster: &str, fetch: F)
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = u64>,
     {
-        let target = fetch().await;
-        if let Some(state) = self.find(group, cluster) {
-            state.running.store(target, Ordering::Relaxed);
-        }
+        let Some(state) = self.find(group, cluster) else {
+            return;
+        };
+        let _serialized = state.reconcile.lock().await;
+
+        let before = state.running();
+        let engine = fetch().await;
+        state.correct(before, engine);
     }
 }
 
