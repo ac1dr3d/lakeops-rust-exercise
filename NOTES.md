@@ -9,7 +9,7 @@
 | INC-3    | `try_acquire` made one attempt on one cluster. Ties went to the *last* cluster, so concurrent callers piled onto the same one, and the losers got `Busy` while other clusters had free slots.                                                                                                                                                                     | `inc3_concurrent_callers_are_not_rejected_while_capacity_is_free`                                                                   | Try every cluster, most free slots first. `Busy` only after all of them refuse.                                                                                       |
 | INC-4    | `Permit` had no `Drop`; only an explicit `release()` returned the slot. Client timeouts and disconnects dropped the request future with the permit inside it, leaking the slot until restart. The racy `store` from INC-1 could also erase releases.                                                                                                              | `inc4_dropped_permit_returns_its_slot`, `inc4_client_timeouts_during_engine_outage_do_not_leak_slots`                               | `impl Drop for Permit`; `release()` just drops it. The permit holds the `Arc<ClusterState>` it was admitted to, instead of names that `release` had to look up again. |
 
-All tests are in `tests/incidents.rs`. I ran each one against the original `src/lib.rs` (in a separate git worktree), in debug and release, and each fails there. After the fix, the whole file passed 30/30 runs in debug and 30/30 in release.
+All tests are in `tests/incidents.rs`. I ran each one against the original `src/lib.rs` (in a separate git worktree), in debug and release, and every test file fails there (7 of 7 in `incidents.rs`). After the fix, the whole file passed 30/30 runs in debug and 30/30 in release.
 
 Notes on the tests:
 
@@ -22,29 +22,168 @@ Known limits after Part 1:
 
 - **Ties go to the first cluster.** Equal free capacity still resolves to the first cluster in config order (stable sort), so concurrent callers still collide on it. Correctness is fine thanks to the fallback; spreading ties out is a Part 2 concern.
 - **`Busy` is not decided at a single instant.** It means each cluster was full when we tried it, which is the honest guarantee without a group-wide lock.
-- **Metrics key collision.** `admissions` still uses a global `Mutex` and `"{group}/{cluster}"` keys, so group `a/b` + cluster `c` and group `a` + cluster `b/c` share a counter. To fix in Part 2.
+- **Metrics key collision.** `admissions` used a global `Mutex` and `"{group}/{cluster}"` keys, so group `a/b` + cluster `c` and group `a` + cluster `b/c` shared a counter. Fixed in Part 2 by keeping the counter on the cluster state.
 
 ## Part 2: Performance
 
-Machine (CPU and core count):
+Machine: Intel i5-1135G7, 4 cores / 8 hardware threads (so `acquire_release/16` is
+oversubscribed). Baseline saved from the untouched starter with
+`cargo bench -- --save-baseline starter`; compare with `--baseline starter`.
 
-| Bench | Before | After |
-|-------|--------|-------|
-| acquire_release/1  | | |
-| acquire_release/4  | | |
-| acquire_release/16 | | |
+| Bench | Before | After | Change |
+|-------|--------|-------|--------|
+| acquire_release/1  | 1.95 M/s (513 ns) | 16.3 M/s (61 ns) | 8.4x |
+| acquire_release/4  | 3.71 M/s (1.08 µs) | 23.2 M/s (173 ns) | 6.2x |
+| acquire_release/16 | 4.74 M/s (3.38 µs) | **29.3 M/s (546 ns)** | **6.2x** (target was 3x) |
 
-Changes, and why each one helps (or didn't):
+Absolute numbers move 5-10% between runs on this laptop, so the deltas below were
+each measured back to back. `p = 0.00` on the starter comparison.
 
--
+I added two benchmarks because the starter's `acquire + release` loop keeps
+`running` near zero, which is not what a gateway looks like:
 
-Selection policy, and why:
+| Bench | `/1` | `/4` | `/16` |
+|-------|------|------|-------|
+| acquire_release (starter shape) | 16.6 M/s | 23.4 M/s | 30.0 M/s |
+| acquire_release_held (100 permits held per thread) | 16.7 M/s | 21.5 M/s | 25.9 M/s |
+| acquire_release_mixed (capacities 1M >> i, eight clusters) | 16.2 M/s | 19.1 M/s | 20.5 M/s |
+
+`mixed` is the slowest and that is expected: with wildly unequal capacities, a
+capacity-following policy sends nearly all traffic to the biggest cluster, so every
+core writes the same counter. It is still 4.3x the starter on that shape. In
+production groups the capacities are within a small factor of each other, which is
+the `acquire_release` shape.
+
+### Changes, and why each one helps (or didn't)
+
+Each row is one change and one bench run, in the order I made them. Rows 1-6 and
+7-8 are two separate lineages (`6a` was later replaced by `6b`), so only compare
+within a row.
+
+| # | Change | `/1` | `/16` | Why |
+|---|--------|------|-------|-----|
+| 0 | starter | 513 ns | 4.74 M/s | baseline |
+| 1 | Part 1 correctness fixes | 228 ns | 2.57 M/s | **Faster single-threaded, slower under load.** A CAS loop retries where the old `store` never did, and the mutex it replaced *queued* threads while the CAS loop makes them fight over one cache line. I did not profile this; it is the most likely reading of the numbers. Correctness first, and the rest of the list is what recovers the throughput. |
+| 2 | spread the tie-break (`ROTATION`) | 233 ns | 2.55 M/s | **Measured: no effect.** A global mutex was still serializing the call, so nothing about selection could show up. Kept because it is what stops callers converging on one cluster once the shared writes are gone. |
+| 3 | per-cluster `admissions: AtomicU64`, drop the global `Mutex<HashMap>` + `format!` | 161 ns | 4.70 M/s | Removes a lock acquisition, a `String` allocation and a `HashMap` lookup per admission. Also fixes the key collision where group `a/b` + cluster `c` and group `a` + cluster `b/c` shared one counter. |
+| 4 | `Arc<[Arc<ClusterState>]>` per group + lookup by `&str` | 69 ns | 8.31 M/s | Removed 2 heap allocations (`group.to_string()`, `Vec` clone) and 16 refcount operations on cluster state per cycle (8 clone + 8 drop), at the cost of 2 on the group slice: 14 net. Each bump is a write to a shared cache line. Largest single-threaded win. |
+| 5 | power of two choices instead of a full scan | 59 ns | 25.6 M/s | The scan read both counters of all 8 clusters: 16 loads from lines other cores were writing. Two samples need 4. |
+| 6a | `ArcSwap` for the topology | 54 ns | 25.4 M/s | Read the topology without taking a lock. `RwLock::read` is a read-modify-write on a shared word, and cloning the group `Arc` per call was another shared write. **`ArcSwap::load` is not a plain load**: it swaps the pointer into a per-thread hazard slot (`SeqCst`), which is why it is fast — the write is to memory no other core shares. |
+| 6b | per-thread topology snapshot, std only (replaces 6a) | 43 ns | 27.0 M/s | Same idea without the dependency: a thread-local `Arc` plus a version counter that only `reload` writes. A hit reads one word that every core keeps cached and writes nothing; a miss takes the `RwLock` once. Measured faster than 6a in the same session (27.0 vs 25.4 M/s). |
+| 7 | fix the tie-break pairing bug | 60 ns | 30.0 M/s | Final run, with the bug below fixed. |
+
+Two things worth keeping:
+
+- **Dropping a capability probe entirely is faster and wrong.** Replacing selection
+  with pure rotation (no capacity comparison at all) measured **37 M/s** at `/16`.
+  That is the fastest number I saw, but it ignores free capacity, so it is not a
+  policy I would ship. It is how I learned the scan, not the atomics, was the
+  remaining limit.
+- **The `admissions` counter shares a cache line with `running`.** They are written
+  by the same caller in the same call, so I did not pad it; I have not measured
+  whether padding helps.
+
+### A bug the review caught, and the test that now guards it
+
+My first tie-break drew `start` and `second` from a per-thread counter that
+advanced by one **per draw, two draws per call**. So `start` was always
+`odd % n`. For any even group size that means even-indexed clusters were never
+preferred on a tie: with 8 clusters and one query in flight, clusters 0, 2, 4 and 6
+got **zero** admissions out of 8,000, and 64 freshly spawned threads all picked the
+same cluster on their first call.
+
+`tests/selection.rs` now checks that sequential traffic on 2, 3, 4 and 8 equal
+clusters spreads within a factor of two, that fresh threads fan out, that a cluster
+with 10x the capacity takes most of the load, and that filling a group uses every
+cluster. The fix is one SplitMix64 draw per call, seed per thread, low 32 bits for
+the first sample and high 32 bits for the second, so both are independent and
+uniform, which is what the power-of-two-choices bound actually assumes.
+
+### Selection policy, and why
+
+1. **Fast path: power of two choices.** Sample two clusters uniformly at random and
+   try the one with more free slots. P2C is the standard approximation of
+   least-loaded: capacity-aware, provably close to optimal spread, two probes
+   instead of a scan of every cluster.
+2. **The atomic increment decides, not the sample.** Free-slot counts only choose
+   what to try, so a stale read costs a retry, never a cap violation.
+3. **Slow path, only when the sampled cluster is full: try every other cluster
+   once.** This keeps the INC-3 guarantee: `Busy` means every cluster in the group
+   refused, never "the two I sampled were full". It costs a scan, but only on the
+   path that was about to return `Busy`.
+4. **Ties are uniform per call**, not per thread, so callers fan out instead of
+   queueing behind one cluster.
+
+Known trade-off: following capacity means unequal capacities concentrate traffic on
+the largest cluster (see `acquire_release_mixed`), which costs throughput under
+contention. The alternative is a fixed round-robin, which is faster per call but
+ignores capacity.
+
+### No dependency added
+
+I tried `arc-swap` first (row 6a) and then replaced it with the std-only per-thread
+snapshot above, which measured faster and removed the dependency. `reload` now takes
+the write lock, builds the new topology once and bumps the version while holding the
+lock. That is also why there is no read-copy-update retry closure: the earlier
+`ArcSwap::rcu` version updated live caps *inside* a closure that can re-run on
+contention, which could clobber a concurrent `set_max_running`. The cost of the std
+version is that a thread caches one pool, so a process serving two pools refreshes on
+every call (still correct, just slower); a gateway has one pool.
+
+### Reload preserves cluster identity
+
+Moving the metric onto the cluster state made `reload` a correctness problem: it
+used to rebuild every `ClusterState`, which would have reset both `running` and
+`admissions` on every config reload (counts to zero, and a cluster with in-flight
+queries advertising full capacity again). `build_groups` now reuses the existing
+state for each `(group, name)` and only updates the cap. `tests/reload.rs` covers
+that, cap changes in both directions, added/removed clusters, concurrent reloads, and
+that a thread which already cached the old topology picks up a reload on its next
+call. Six of the seven tests fail on the previous implementation; the metric test
+passes there by accident, because that version kept metrics in a map that survived
+reload.
+
+Numbers to re-check before shipping: measured on a 4-core laptop with 16 threads
+oversubscribed, so the ceiling on a 16-core pod is higher, but the ordering should
+hold. Everything is `Relaxed` atomics in CAS loops, which is the cheapest correct
+choice for a counter; if a profile ever shows the per-cluster line as the limit, the
+next step is to shard the counter, not to add fences.
 
 ## Part 3: Waiting for a slot
 
 ## Part 4: Global admission across 6 pods
 
 ## Bonus: INC-5 and INC-6
+
+### INC-6: reload (fixed)
+
+Two symptoms: clusters briefly ran above their caps, and dashboards showed running
+counts reset to zero.
+
+Both came from `reload` rebuilding every `ClusterState` with `running = 0`:
+- a cluster with 35 queries in flight came back advertising 40 free slots, and the
+  next 40 admittances were granted on top of the 35 already running;
+- every counter an operator was watching went to zero;
+- in-flight `Permit`s then released against the *new* counters, driving them below
+  zero and wrapping them to ~`u64::MAX` (the INC-1 wedge, reachable from a plain
+  config reload).
+
+What it does now: a cluster is identified by `(group, name)` across reloads, so the
+existing state object is reused and only `max_running` changes. Removed clusters
+leave the config and take no new traffic; a `Permit` for one keeps its own state
+alive, so its release can never touch a different cluster. Concurrent reloads are
+serialized by the write lock, so the build happens once and cannot lose a swap.
+
+Guarantees: a reload never changes `running`, never resets `admissions`, never
+admits past the new cap, and never writes a cap that a concurrent
+`set_max_running` did not ask for.
+
+Not done: a cluster removed from the config drops out immediately even if it still
+has queries in flight, so a re-added cluster starts from zero while old queries may
+still be running. Draining a removed cluster (keep it in a "closed" state until its
+permits return) is the honest fix; I would want it before shipping.
+
+### INC-5: reconcile (not done)
 
 ## Before shipping, I would still want
 
