@@ -178,3 +178,67 @@ fn concurrent_reloads_do_not_lose_state() {
     drop(held);
     assert_eq!(pool.running("g", "a"), Some(0));
 }
+
+#[tokio::test]
+async fn set_max_running_raising_cap_wakes_parked_waiters() {
+    use std::time::{Duration, Instant};
+
+    let pool = pool(&[("a", 1)]);
+    let _held = pool.try_acquire("g").unwrap();
+
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move { pool.acquire_timeout("g", Duration::from_secs(5)).await })
+        })
+        .collect();
+    while pool.queued("g") < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    let raised_at = Instant::now();
+    pool.set_max_running("g", "a", 3);
+
+    for w in waiters {
+        let permit = w
+            .await
+            .unwrap()
+            .expect("waiter should be woken when cap is raised");
+        assert_eq!(permit.cluster(), "a");
+    }
+    assert!(
+        raised_at.elapsed() < Duration::from_millis(100),
+        "waiters were not woken promptly when cap was raised"
+    );
+    assert_eq!(pool.queued("g"), 0);
+}
+
+#[tokio::test]
+async fn reload_adding_capacity_wakes_parked_waiters() {
+    use std::time::{Duration, Instant};
+
+    let pool = pool(&[("a", 1)]);
+    let _held = pool.try_acquire("g").unwrap();
+
+    let waiter = {
+        let pool = Arc::clone(&pool);
+        tokio::spawn(async move { pool.acquire_timeout("g", Duration::from_secs(5)).await })
+    };
+    while pool.queued("g") < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    let reloaded_at = Instant::now();
+    pool.reload(config(&[("a", 1), ("b", 1)]));
+
+    let permit = waiter
+        .await
+        .unwrap()
+        .expect("waiter should be woken when reload adds a cluster");
+    assert_eq!(permit.cluster(), "b");
+    assert!(
+        reloaded_at.elapsed() < Duration::from_millis(100),
+        "waiter was not woken promptly when reload added capacity"
+    );
+    assert_eq!(pool.queued("g"), 0);
+}

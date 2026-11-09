@@ -274,3 +274,35 @@ async fn try_acquire_is_not_blocked_by_a_reconcile_holding_its_lock() {
         "the correction changed nothing"
     );
 }
+
+#[tokio::test]
+async fn reconcile_recovering_drifted_slots_wakes_parked_waiters() {
+    let pool = pool(2);
+    leak(&pool, 2); // cluster is wedged at 2/2 with no live permits
+
+    let waiters: Vec<_> = (0..2)
+        .map(|_| {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move { pool.acquire_timeout("g", Duration::from_secs(5)).await })
+        })
+        .collect();
+    while pool.queued("g") < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    let started = std::time::Instant::now();
+    pool.reconcile("g", "a", || async { 0 }).await;
+
+    for w in waiters {
+        let permit = w
+            .await
+            .unwrap()
+            .expect("waiter should be woken by reconcile");
+        assert_eq!(permit.cluster(), "a");
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "waiters were not woken promptly after reconcile freed slots"
+    );
+    assert_eq!(pool.queued("g"), 0);
+}

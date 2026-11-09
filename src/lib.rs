@@ -162,6 +162,15 @@ impl GroupWake {
         }
     }
 
+    /// Capacity was added or recovered by an admin path (`set_max_running`,
+    /// `reload`, or a downward `reconcile`), which can open several slots at once:
+    /// wake every parked waiter so they can compete for the new slots immediately.
+    fn wake_all(&self) {
+        if self.queued.load(Ordering::Relaxed) > 0 {
+            self.notify.notify_waiters();
+        }
+    }
+
     fn queued(&self) -> u64 {
         self.queued.load(Ordering::Relaxed)
     }
@@ -221,7 +230,10 @@ impl ClusterState {
     }
 
     fn set_max_running(&self, max_running: u64) {
-        self.max_running.store(max_running, Ordering::Relaxed);
+        let previous = self.max_running.swap(max_running, Ordering::Relaxed);
+        if max_running > previous {
+            self.wake.wake_all();
+        }
     }
 
     /// Free slots. `running` can legitimately exceed `max_running` after a cap
@@ -248,8 +260,13 @@ impl ClusterState {
     /// Shift the counter by `engine - before`, saturating at zero.
     ///
     /// A read-modify-write, so admissions and releases racing with it are kept.
+    /// A downward correction recovers slots that had drifted, so any parked
+    /// waiters are woken to take them.
     fn correct(&self, before: u64, engine: u64) {
         protocol::correct_by(&self.running, before, engine);
+        if engine < before {
+            self.wake.wake_all();
+        }
     }
 }
 
@@ -474,9 +491,18 @@ impl ClusterPool {
         // Reloads are rare and serialized by the write lock, so `build_groups` runs
         // exactly once per reload (it updates live caps as it goes). Readers keep
         // using their cached snapshot until they see the new version.
-        let mut topology = self.topology.write().unwrap();
-        *topology = Arc::new(build_groups(&config, &topology));
-        self.version.fetch_add(1, Ordering::Release);
+        let next = {
+            let mut topology = self.topology.write().unwrap();
+            let next = Arc::new(build_groups(&config, &topology));
+            *topology = Arc::clone(&next);
+            self.version.fetch_add(1, Ordering::Release);
+            next
+        };
+        // Wake after publishing `version` and dropping the write lock, so woken
+        // waiters see the new topology (e.g. a newly added cluster or raised cap).
+        for group in next.values() {
+            group.wake.wake_all();
+        }
     }
 
     /// Bonus: correct a cluster's running counter against the engine's own count.

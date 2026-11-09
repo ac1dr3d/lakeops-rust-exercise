@@ -228,8 +228,9 @@ run in both orders to cancel drift), so `/16` lands at 27.8-29.1 M/s and still a
 
 ### Guarantees
 
-- **Prompt wake.** A release wakes a parked caller immediately; the test asserts
-  under 100 ms and it is normally microseconds. Not "on the next poll": the loop only
+- **Prompt wake.** A release — or capacity added by `set_max_running`, `reload`, or a
+  downward `reconcile` — wakes parked callers immediately; the tests assert under
+  100 ms and it is normally microseconds. Not "on the next poll": the loop only
   re-checks when notified or when the deadline expires.
 - **`queued` is exact.** It counts callers currently inside `acquire_timeout` for that
   group, including ones being cancelled, and drops to zero on timeout, cancellation
@@ -378,20 +379,19 @@ Four further decisions in that function:
   engine may be running queries this gateway did not admit, e.g. a second pod);
   the cluster then takes no new queries until it drains. It cannot go below zero.
 
-What the guarantee still is *not*: the delta assumes `engine - before` stayed
-constant while the answer was in flight. It did not have to. Any change in the
-engine's own in-flight count during that window is still lost — a query that
-finished at the engine before it answered, or one the engine started for someone
-else, is not visible in either number. So the residual error is bounded by the
-number of queries the engine itself started or finished inside one fetch round trip,
-per reconcile, and under sustained load where queries finish faster than the fetch
-that error can persist rather than vanish. Removing it entirely needs the engine to
-report identifiably-versioned counts, or a read that is atomic with respect to the
-hot path, which the brief rules out for `try_acquire`. Being bounded and
-self-correcting on the next pass is the honest guarantee; "exact" is not available
-here.
+What the guarantee still is *not*: the delta assumes the engine's answer reflects
+the moment `before` was snapshotted. In practice the engine samples at some point
+during the fetch, so any net change in in-flight queries between `before` and the
+engine's sample is counted twice: net releases before the sample leave the counter
+too low (by at most those releases), and net admissions before the sample leave it
+too high (by at most those admissions). In steady state (`admissions ≈ releases`)
+the two largely cancel, and the error **does not compound across passes** — each
+reconcile replaces the residual with that pass's own pre-sample delta, and a single
+quiet pass restores the exact count. Removing the residual entirely would need the
+engine to report a versioned/timestamped count or a read atomic with respect to the
+hot path, which the brief rules out for `try_acquire`.
 
-Tests: `tests/reconcile.rs`, 8 tests, all deterministic interleavings rather than
+Tests: `tests/reconcile.rs`, 10 tests, all deterministic interleavings rather than
 sleeps. The engine is a pair of channels: the fetch closure signals the test the
 moment it is called, then waits for the test to send its answer, so the test's
 traffic lands exactly inside the fetch window.
@@ -406,6 +406,8 @@ traffic lands exactly inside the fetch window.
 | `cancelled_reconcile_changes_nothing_and_does_not_block_the_next` | passes |
 | `reconcile_for_an_unknown_cluster_is_a_no_op` | passes |
 | `reconcile_spanning_a_reload_never_touches_the_new_cluster` | passes |
+| `try_acquire_is_not_blocked_by_a_reconcile_holding_its_lock` | passes; **fails if `blocking_lock()` is injected on the hot path** |
+| `reconcile_recovering_drifted_slots_wakes_parked_waiters` | **fails** without `wake_all()` on downward correction |
 
 The last five are behaviour I chose and want to keep; they passed on the old code
 too, so I check them by breaking the new code on purpose (removing the lock, or the
