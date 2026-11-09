@@ -122,9 +122,13 @@ pub mod protocol {
     }
 
     /// Return one slot; never wraps below zero (INC-1).
+    ///
+    /// Returns the value the counter had before the release, or `None` if it was
+    /// already zero. Callers use that to tell whether the cluster *was* at capacity,
+    /// which is the only case where a waiter could now proceed (Part 3).
     #[inline]
-    pub fn release_one<C: Counter + ?Sized>(counter: &C) {
-        let _ = counter.update(release);
+    pub fn release_one<C: Counter + ?Sized>(counter: &C) -> Option<u64> {
+        counter.update(release).ok()
     }
 
     /// Apply a reconcile delta as one read-modify-write, so traffic during the
@@ -132,6 +136,53 @@ pub mod protocol {
     #[inline]
     pub fn correct_by<C: Counter + ?Sized>(counter: &C, before: u64, engine: u64) {
         let _ = counter.update(|current| Some(correct(current, before, engine)));
+    }
+}
+
+/// Wakes callers parked in `acquire_timeout` for one group.
+///
+/// One per group, shared by every `ClusterState` in it, so a releasing permit can
+/// wake a waiter without a lookup, an allocation or an extra reference on the hot
+/// path. Identity follows the group name across `reload`, which is what keeps a
+/// waiter reachable after the config swaps underneath it.
+#[derive(Debug, Default)]
+struct GroupWake {
+    notify: tokio::sync::Notify,
+    queued: AtomicU64,
+}
+
+impl GroupWake {
+    /// A release happened: wake one waiter, if anyone is waiting.
+    ///
+    /// Reading `queued` is a plain load of a word nobody writes while the group is
+    /// idle, so this costs a load and no invalidation on the hot path.
+    fn wake_one(&self) {
+        if self.queued.load(Ordering::Relaxed) > 0 {
+            self.notify.notify_one();
+        }
+    }
+
+    fn queued(&self) -> u64 {
+        self.queued.load(Ordering::Relaxed)
+    }
+}
+
+/// Counts a caller as queued for as long as it lives, including on cancellation,
+/// which is what makes `queued()` honest for a dropped wait future.
+struct Queued<'a> {
+    wake: &'a GroupWake,
+}
+
+impl<'a> Queued<'a> {
+    fn new(wake: &'a GroupWake) -> Self {
+        wake.queued.fetch_add(1, Ordering::Relaxed);
+        Self { wake }
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.wake.queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -145,16 +196,19 @@ struct ClusterState {
     admissions: AtomicU64,
     /// Serializes `reconcile` for this cluster (INC-5). Never taken on the hot path.
     reconcile: tokio::sync::Mutex<()>,
+    /// The group's wake object, so `Permit::drop` can wake a waiter (Part 3).
+    wake: Arc<GroupWake>,
 }
 
 impl ClusterState {
-    fn new(config: &ClusterConfig) -> Self {
+    fn new(config: &ClusterConfig, wake: Arc<GroupWake>) -> Self {
         Self {
             name: config.name.clone(),
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
             admissions: AtomicU64::new(0),
             reconcile: tokio::sync::Mutex::new(()),
+            wake,
         }
     }
 
@@ -232,7 +286,13 @@ fn random() -> u64 {
 /// instead of copying the whole list and bumping a refcount per cluster.
 type Clusters = Arc<[Arc<ClusterState>]>;
 
-type Topology = HashMap<String, Clusters>;
+/// One group: its clusters and the object that wakes its waiters.
+struct Group {
+    clusters: Clusters,
+    wake: Arc<GroupWake>,
+}
+
+type Topology = HashMap<String, Arc<Group>>;
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -262,7 +322,7 @@ impl ClusterPool {
         Arc::new(Self {
             id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
             version: AtomicU64::new(0),
-            topology: RwLock::new(Arc::new(build_groups(&config, &HashMap::new()))),
+            topology: RwLock::new(Arc::new(build_groups(&config, &Topology::new()))),
         })
     }
 
@@ -300,7 +360,11 @@ impl ClusterPool {
     /// Lookup is by `&str` directly: `HashMap<String, _>` borrows its keys, so no
     /// per-call `String` allocation.
     fn clusters(&self, group: &str) -> Option<Clusters> {
-        self.topology.read().unwrap().get(group).cloned()
+        self.topology
+            .read()
+            .unwrap()
+            .get(group)
+            .map(|g| Arc::clone(&g.clusters))
     }
 
     fn find(&self, group: &str, cluster: &str) -> Option<Arc<ClusterState>> {
@@ -320,7 +384,8 @@ impl ClusterPool {
     /// never a cap violation.
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
         self.with_topology(|topology| {
-            admit_to(topology.get(group).ok_or(AcquireError::UnknownGroup)?)
+            let group = topology.get(group).ok_or(AcquireError::UnknownGroup)?;
+            admit_to(&group.clusters)
         })
     }
 
@@ -330,8 +395,46 @@ impl ClusterPool {
         group: &str,
         wait: Duration,
     ) -> Result<Permit, AcquireError> {
-        let _ = (group, wait);
-        todo!("Part 3")
+        // Resolve the group once, before waiting: a reload must not redirect this
+        // caller to a different group's waiters half-way through.
+        let wake = self
+            .with_topology(|topology| {
+                topology
+                    .get(group)
+                    .map(|g| (Arc::clone(&g.wake), g.clusters.is_empty()))
+            })
+            .ok_or(AcquireError::UnknownGroup)?;
+        let (wake, empty) = wake;
+        if empty {
+            // Nothing will ever free a slot in a group with no clusters.
+            return Err(AcquireError::Busy);
+        }
+
+        let _queued = Queued::new(&wake);
+        let deadline = tokio::time::Instant::now() + wait;
+
+        loop {
+            // Fast path: a slot is free right now.
+            if let Ok(permit) = self.try_acquire(group) {
+                return Ok(permit);
+            }
+
+            // Register interest *before* the second check, so a release that lands
+            // between the check and the await is not lost (tokio's documented
+            // enable-then-check ordering).
+            let notified = wake.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Ok(permit) = self.try_acquire(group) {
+                return Ok(permit);
+            }
+
+            match tokio::time::timeout_at(deadline, notified).await {
+                Ok(()) => continue, // a slot probably freed; re-check
+                Err(_) => return Err(AcquireError::Timeout),
+            }
+        }
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -341,8 +444,12 @@ impl ClusterPool {
 
     /// Number of callers currently waiting inside `acquire_timeout` for `group`.
     pub fn queued(&self, group: &str) -> u64 {
-        let _ = group;
-        todo!("Part 3")
+        self.topology
+            .read()
+            .unwrap()
+            .get(group)
+            .map(|g| g.wake.queued())
+            .unwrap_or(0)
     }
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
@@ -413,28 +520,37 @@ impl ClusterPool {
 /// state is reused and only the cap is updated. That keeps `running`,
 /// `admissions` and every in-flight `Permit` pointing at the same counters
 /// (INC-6), so a reload cannot reset counts or let a cluster exceed its cap.
-fn build_groups(
-    config: &PoolConfig,
-    previous: &HashMap<String, Clusters>,
-) -> HashMap<String, Clusters> {
+fn build_groups(config: &PoolConfig, previous: &Topology) -> Topology {
     config
         .groups
         .iter()
         .map(|(group, clusters)| {
             let old = previous.get(group);
+            // The wake object follows the group *name*, so a caller parked on it
+            // stays reachable across a reload even if every cluster is replaced.
+            let wake = match old {
+                Some(existing) => Arc::clone(&existing.wake),
+                None => Arc::new(GroupWake::default()),
+            };
             let states: Clusters = clusters
                 .iter()
                 .map(
-                    |c| match old.and_then(|s| s.iter().find(|state| state.name == c.name)) {
+                    |c| match old.and_then(|s| s.clusters.iter().find(|st| st.name == c.name)) {
                         Some(existing) => {
                             existing.set_max_running(c.max_running);
                             Arc::clone(existing)
                         }
-                        None => Arc::new(ClusterState::new(c)),
+                        None => Arc::new(ClusterState::new(c, Arc::clone(&wake))),
                     },
                 )
                 .collect();
-            (group.clone(), states)
+            (
+                group.clone(),
+                Arc::new(Group {
+                    clusters: states,
+                    wake,
+                }),
+            )
         })
         .collect()
 }
@@ -470,6 +586,14 @@ impl Permit {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.state.decrement();
+        // Part 3: hand the freed slot to a caller parked in `acquire_timeout`.
+        //
+        // This must happen on *every* release, not only when the cluster was full:
+        // two concurrent releases can free two slots, and only the first looks like
+        // it came from a full cluster. Wake-one-on-every-release with waiters
+        // present is what makes progress, and `wake_one` returns after one plain
+        // load when nobody is waiting.
+        self.state.wake.wake_one();
     }
 }
 
