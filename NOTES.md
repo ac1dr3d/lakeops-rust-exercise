@@ -253,33 +253,39 @@ Today each pod enforces `max_running` alone, so a cluster with a cap of 40 can r
 a single point of failure in front of every query.
 
 **Design: leased shares, admission stays local.** Split each cluster's cap into six
-*shares*. A small coordinator (etcd lease, or a control-plane loop) grants each pod a
-share and rebalances it every second or so from reported demand and actual usage. The
-gateway admits locally against its share, so `try_acquire` is byte-for-byte what ships
-today: no network, no lock, no new state on the hot path — the share simply *is* that
-pod's `max_running`. Cost: zero per query, plus one background report per pod per
-second.
+integer *shares* (for `max_running = 40`, four pods start at 7 and two at 6; no
+remainder slots are wasted). A lightweight coordinator (one elected gateway pod via a
+Kubernetes `Lease`, or a small control-plane loop) grants each pod a share with a short
+TTL (say 2 s) and rebalances every ~500 ms toward pods reporting higher `running` +
+`queued`. The gateway applies its grant via `set_max_running`, so `try_acquire` is
+byte-for-byte what ships today: **zero network I/O, zero locks, and zero new state on
+the hot path.** For tiny caps (`max_running < 6`), idle pods hold a share of `0` and
+borrow a token on demand inside `acquire_timeout`.
 
-**Pod dies holding slots.** Its lease expires (TTL of a few seconds) and the
-coordinator reassigns the share; until then the group runs *below* its cap, which is
-the safe direction. Queries on the dead pod are lost anyway, so the slot is genuinely
-free — the lease is a better accounting of reality than a counter nobody can read.
+**Pod dies holding slots.** Two things happen separately:
+1. *Gateway quota:* the dead pod's lease expires at `TTL + grace` (clock-skew buffer)
+   and the coordinator reassigns its share to surviving pods; until then the group runs
+   *below* its cap, which is the safe direction.
+2. *Engine reality:* a crashed gateway pod drops its client connections, but Trino or
+   StarRocks may keep executing the orphan queries briefly until TCP teardown or
+   `client.timeout` fires. Surviving pods' `reconcile` loops pick up those orphan
+   engine queries in their delta until the engine finishes them.
 
-**Network partition.** No renewal, and shares are only reassigned with a quorum of pods
-present, so during a partition nobody's share moves and the sum of shares stays ≤ the
-cap: an over-admitting pod cannot take a dead pod's quota. The price is that surviving
-pods keep only their old share until the partition heals; if a pod cannot renew for
-several TTLs it halves its own share each time, trading utilisation for safety. We
-choose availability of *capacity* over exact global accounting — with the engines
-themselves (Trino queues, StarRocks limits) as the hard backstop, brief overshoot
-degrades into engine-side queueing rather than a breach.
+**Network partition.** To the coordinator, a pod partitioned from the control plane
+looks identical to a dead pod, so lease timing must prevent double-granting:
+- **Isolated pod (cannot renew by `TTL`):** drops its leased surplus at `TTL` down to a
+  conservative static fallback (`floor(max_running / 6)`), and the coordinator only
+  re-grants the *surplus* above that fallback after `TTL + grace` unless the pod is
+  confirmed terminated.
+- **Coordinator lost (no quorum):** every pod falls back to its static `1/6` share.
+  We trade utilisation under skew for a bounded cap, with the engines' own queues
+  (Trino resource groups, StarRocks query queues) as the final safety net.
 
 **What I would deliberately not build:** a synchronous global counter or distributed
 lock per admission (adds an RTT and a SPOF to every query, and its failure mode is a
-total outage rather than a soft cap); consensus per query (Raft on the hot path); and
-"exact" accounting, which in a partition is either unavailable or wrong. I would also
-not build per-slot leases — six pods × thousands of slots is a coordination storm for
-a limit that is policy, not physics.
+total outage rather than a soft cap); consensus per query (Raft on the hot path);
+per-slot leases (6 pods × thousands of slots is a coordination storm); and an external
+etcd/Redis cluster just for 6 pods when a k8s `Lease` + peer heartbeat is enough.
 
 ## Bonus: INC-5 and INC-6
 
