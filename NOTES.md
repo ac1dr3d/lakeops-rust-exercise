@@ -36,9 +36,11 @@ oversubscribed). Baseline saved from the untouched starter with
 | acquire_release/4  | 3.71 M/s (1.08 µs) | 23.2 M/s (173 ns) | 6.2x |
 | acquire_release/16 | 4.74 M/s (3.38 µs) | **~29 M/s (559 ns)** | **6.2x** (target was 3x) |
 
-`/16` measures 28.2-30.0 M/s across runs on this laptop. The `protocol` seam added
-later (see the extra-credit note) costs nothing measurable: `--baseline final` puts
-the change inside the run-to-run spread, with the confidence interval straddling zero.
+`/16` measures 27.8-30.0 M/s across runs on this laptop. Two later additions were
+measured against a saved baseline rather than assumed free: the `protocol` seam (see
+the extra-credit note) costs nothing measurable, while Part 3's wake-up check in
+`Permit::drop` costs 1-3% (about 2% typical, A/B in both orders) because a release has
+to look at whether anyone is queued.
 
 Absolute numbers move 5-10% between runs on this laptop, so the deltas below were
 each measured back to back. `p = 0.00` on the starter comparison.
@@ -155,7 +157,128 @@ next step is to shard the counter, not to add fences.
 
 ## Part 3: Waiting for a slot
 
+`acquire_timeout` is `try_acquire` plus a queue. All six tests in `tests/waiting.rs`
+pass; the file was not modified.
+
+### Where the queue lives
+
+Each group gets one `GroupWake` (a `tokio::sync::Notify` plus a `queued: AtomicU64`),
+and **every `ClusterState` in the group holds an `Arc` to it**. That choice is what
+keeps the releasing side cheap:
+
+- `Permit::drop` already owns its `Arc<ClusterState>`, so it can wake a waiter with no
+  lookup, no allocation and no extra reference;
+- the wake object follows the *group name* across `reload`, so a caller parked on it
+  stays reachable even when every cluster in the group is replaced;
+- waiters on a group that is *removed* from the config are not woken; they run to
+  their own deadline. Documented, not fixed.
+
+`acquire_timeout` resolves the group once, before waiting, so a reload cannot
+redirect a parked caller to another group's waiters.
+
+### The wait loop
+
+```rust
+let _queued = Queued::new(&wake);              // RAII: correct on cancel, too
+let deadline = Instant::now() + wait;
+loop {
+    if let Ok(permit) = self.try_acquire(group) { return Ok(permit); }
+    let notified = wake.notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();                // register BEFORE re-checking
+    if let Ok(permit) = self.try_acquire(group) { return Ok(permit); }
+    match timeout_at(deadline, notified).await {
+        Ok(()) => continue,                    // a slot may have freed; re-check
+        Err(_) => return Err(AcquireError::Timeout),
+    }
+}
+```
+
+Three details that matter:
+
+1. **Enable, then check, then await.** A release between the first failed attempt and
+   the `await` would otherwise be lost. This is tokio's documented ordering for
+   `Notify`, and it is what the `no_lost_wakeups_under_load` test hammers.
+2. **The `Queued` guard, not a counter bump at the end.** A caller that is cancelled
+   mid-wait drops the guard, so `queued()` cannot leak. Same for the timeout path.
+3. **`timeout_at` with one deadline**, so a spurious wake-up does not reset the wait.
+
+### The release side, and an optimisation that was wrong
+
+`Permit::drop` decrements, then calls `wake_one()`, which returns after one relaxed
+load when nobody is waiting:
+
+```rust
+fn wake_one(&self) {
+    if self.queued.load(Relaxed) > 0 { self.notify.notify_one(); }
+}
+```
+
+I first made that conditional on the *physics* of the release — "a slot only becomes
+available to a waiter when a full cluster releases" — by comparing the decrement's
+previous value against `max_running`. `no_lost_wakeups_under_load` failed: with two
+concurrent releases of two slots, only the first sees a full cluster (the second
+observes `running == max - 1`), so the second waiter is never woken and starves until
+its deadline. Waking on **every** release while waiters exist is what gives progress,
+and the load is the minimum price of knowing whether they exist.
+
+Cost: `acquire_release/16` drops by 1-3% (about 2% typical; A/B with the call removed,
+run in both orders to cancel drift), so `/16` lands at 27.8-29.1 M/s and still about
+6x the starter. Recorded rather than hidden: prompt wakeups are not free.
+
+### Guarantees
+
+- **Prompt wake.** A release wakes a parked caller immediately; the test asserts
+  under 100 ms and it is normally microseconds. Not "on the next poll": the loop only
+  re-checks when notified or when the deadline expires.
+- **`queued` is exact.** It counts callers currently inside `acquire_timeout` for that
+  group, including ones being cancelled, and drops to zero on timeout, cancellation
+  and success.
+- **No lost wakeups under load.** 200 callers, 2 slots, 8 worker threads: every caller
+  gets in well before its 10 s deadline (15/15 repeat runs).
+- **`Timeout` means the deadline expired**, never "the sampled cluster was full".
+- **Immediate errors without waiting:** `UnknownGroup` for a group not in the config,
+  and `Busy` for a group with no clusters (no release can ever satisfy it).
+
+Known limit: `notify_one` is not FIFO, so a caller can in principle be overtaken
+repeatedly under sustained saturation. The deadline bounds it; a fair queue would
+mean a per-group intrusive list and a lock on the wake path, which I would not add
+without evidence that starvation shows up in practice.
+
 ## Part 4: Global admission across 6 pods
+
+Today each pod enforces `max_running` alone, so a cluster with a cap of 40 can receive
+240. The obvious fix — one shared counter — puts a network round trip, a dependency and
+a single point of failure in front of every query.
+
+**Design: leased shares, admission stays local.** Split each cluster's cap into six
+*shares*. A small coordinator (etcd lease, or a control-plane loop) grants each pod a
+share and rebalances it every second or so from reported demand and actual usage. The
+gateway admits locally against its share, so `try_acquire` is byte-for-byte what ships
+today: no network, no lock, no new state on the hot path — the share simply *is* that
+pod's `max_running`. Cost: zero per query, plus one background report per pod per
+second.
+
+**Pod dies holding slots.** Its lease expires (TTL of a few seconds) and the
+coordinator reassigns the share; until then the group runs *below* its cap, which is
+the safe direction. Queries on the dead pod are lost anyway, so the slot is genuinely
+free — the lease is a better accounting of reality than a counter nobody can read.
+
+**Network partition.** No renewal, and shares are only reassigned with a quorum of pods
+present, so during a partition nobody's share moves and the sum of shares stays ≤ the
+cap: an over-admitting pod cannot take a dead pod's quota. The price is that surviving
+pods keep only their old share until the partition heals; if a pod cannot renew for
+several TTLs it halves its own share each time, trading utilisation for safety. We
+choose availability of *capacity* over exact global accounting — with the engines
+themselves (Trino queues, StarRocks limits) as the hard backstop, brief overshoot
+degrades into engine-side queueing rather than a breach.
+
+**What I would deliberately not build:** a synchronous global counter or distributed
+lock per admission (adds an RTT and a SPOF to every query, and its failure mode is a
+total outage rather than a soft cap); consensus per query (Raft on the hot path); and
+"exact" accounting, which in a partition is either unavailable or wrong. I would also
+not build per-slot leases — six pods × thousands of slots is a coordination storm for
+a limit that is policy, not physics.
 
 ## Bonus: INC-5 and INC-6
 
