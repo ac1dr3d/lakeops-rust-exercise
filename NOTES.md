@@ -34,7 +34,11 @@ oversubscribed). Baseline saved from the untouched starter with
 |-------|--------|-------|--------|
 | acquire_release/1  | 1.95 M/s (513 ns) | 16.3 M/s (61 ns) | 8.4x |
 | acquire_release/4  | 3.71 M/s (1.08 µs) | 23.2 M/s (173 ns) | 6.2x |
-| acquire_release/16 | 4.74 M/s (3.38 µs) | **29.3 M/s (546 ns)** | **6.2x** (target was 3x) |
+| acquire_release/16 | 4.74 M/s (3.38 µs) | **~29 M/s (559 ns)** | **6.2x** (target was 3x) |
+
+`/16` measures 28.2-30.0 M/s across runs on this laptop. The `protocol` seam added
+later (see the extra-credit note) costs nothing measurable: `--baseline final` puts
+the change inside the run-to-run spread, with the confidence interval straddling zero.
 
 Absolute numbers move 5-10% between runs on this laptop, so the deltas below were
 each measured back to back. `p = 0.00` on the starter comparison.
@@ -174,9 +178,24 @@ leave the config and take no new traffic; a `Permit` for one keeps its own state
 alive, so its release can never touch a different cluster. Concurrent reloads are
 serialized by the write lock, so the build happens once and cannot lose a swap.
 
-Guarantees: a reload never changes `running`, never resets `admissions`, never
-admits past the new cap, and never writes a cap that a concurrent
-`set_max_running` did not ask for.
+Guarantees, now in a shape that can be tested (see `tests/reload.rs`):
+
+- a reload never changes `running`: an in-flight query keeps its slot, and a
+  cluster with 35 running queries comes back with 35, not 0;
+- a reload never resets `admissions`;
+- a reload cannot cause admission past the new cap, because the counter it is
+  compared against is the one that survived the reload;
+- a reload never writes a cap that a concurrent `set_max_running` did not ask for:
+  the topology is built once, under the write lock, not in a retry closure;
+- a `Permit` admitted before a reload always releases the counter it incremented,
+  even if its cluster left the config, so no release can land on another cluster or
+  wrap a fresh counter.
+
+`try_acquire` takes no exclusive lock, as required: on a cache hit it reads one
+`AtomicU64` (the version) and a thread-local, then does one CAS. The `reload` write
+lock and the per-cluster reconcile mutex are never on that path. On a cache miss
+(first call on a thread, or after a reload) it takes the `RwLock` **read** side once
+to refresh its snapshot, which is shared, not exclusive.
 
 Not done: a cluster removed from the config drops out immediately even if it still
 has queries in flight, so a re-added cluster starts from zero while old queries may
@@ -269,9 +288,66 @@ The last five are behaviour I chose and want to keep; they passed on the old cod
 too, so I check them by breaking the new code on purpose (removing the lock, or the
 resolve-before-fetch ordering) rather than by comparing against the starter.
 
-Not done: a `loom` model. The correction is a single CAS on one word, so there is no
-interleaving left in it to model; the interesting interleaving is *between* two
-reconciles, which the per-cluster mutex serializes by construction.
+`try_acquire` must not take the exclusive lock the fix introduces: a test parks a
+`reconcile` on a slow engine (so the mutex is held for the whole fetch) and then does
+50 admissions, with a 1s timeout. It fails if the hot path ever waits on that lock
+(checked by injecting `blocking_lock()` into `try_acquire`, which fails the test).
+
+### Extra credit: deterministic interleaving tests and a `loom` model
+
+Both, because they cover different things.
+
+**Deterministic interleavings.** `tests/reconcile.rs` uses a channel-driven fake
+engine: the fetch closure signals the test the instant it is called, then blocks
+until the test sends the engine's answer. That pins the test's traffic to precisely
+the window the bug lives in, with no sleeps and no retries, so the failure is
+reproducible rather than probabilistic.
+
+**`loom`.** The counter protocol is modelled exhaustively for two threads:
+
+```sh
+RUSTFLAGS="--cfg loom" cargo test --release --test loom_model
+```
+
+Layout, and why it is this shape:
+
+- the model is `tests/loom_model.rs`, a normal integration test file whose first
+  line is `#![cfg(loom)]`, so a normal `cargo test` compiles it to an empty crate;
+- `loom` is a `[target.'cfg(loom)'.dev-dependencies]` entry, so without the flag it is
+  not in the dependency graph at all (`cargo tree` does not list it) and no normal
+  build pays for its ~39 transitive crates;
+- **there is no `cfg(loom)` in `src/`.** Production code always uses `std`'s atomics.
+  To let the model exercise the real logic anyway, the three counter transitions and
+  the CAS wrapper live in `#[doc(hidden)] pub mod protocol`, generic over a small
+  `Counter` trait. `impl Counter for AtomicU64` lives in the library; the model adds a
+  five-line implementation for a thin wrapper around loom's atomic (the orphan rule
+  forbids implementing our trait directly for loom's type).
+
+So the model runs *the same* `admit`/`release`/`correct` transitions and the same
+CAS-shaped `try_admit`/`release_one`/`correct_by` helpers that ship. The only code in
+the model file is the loom delegate, which is `try_update` and `load` and nothing else.
+
+Trade-off, stated plainly: what that seam cannot model is the *shape* of the atomic
+update, because the only implementation of `Counter::update` in the library is now the
+single CAS. That class of bug (a load and a store instead of one RMW — INC-1) is
+eliminated by construction rather than by test: there is exactly one place that reads
+and writes `running`, and it is a compare-and-swap loop. The earlier, cfg-swapped
+version of the model demonstrated it directly; this version guards the transitions.
+
+| Model | Property | Catches (verified by re-injecting the bug) |
+|-------|----------|--------------------------------------------|
+| `concurrent_admission_respects_the_cap` | permits granted never exceed the cap, counter always agrees with permits granted | an off-by-one admission transition (`current <= max`) |
+| `release_racing_a_correction_does_not_wrap` | one permit, one release, one downward correction: lands on 0, never wraps | `wrapping_sub` instead of `checked_sub` |
+| `correction_keeps_admissions_made_after_the_snapshot` | a correction whose answer matches its snapshot changes nothing, in any interleaving | INC-5's `store(engine)` |
+
+Two threads is deliberate: with three, the CAS retry loops make the state space
+explode (a 3-thread version did not finish in 10 minutes), and a one-word CAS protocol
+is exhausted by two threads plus loom's own preemption. Runtime is about a second.
+
+What `loom` does **not** cover, stated plainly: `tokio::sync::Mutex`, so `reconcile`'s
+one-at-a-time serialization is checked by the deterministic test instead; the
+per-thread topology cache (`thread_local!` is not modelled); and `Arc` refcounts. Those
+rely on the real-thread tests, which run every `cargo test`.
 
 ## Before shipping, I would still want
 

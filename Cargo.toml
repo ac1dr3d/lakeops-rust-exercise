@@ -14,3 +14,13 @@ criterion = "0.5"
 [[bench]]
 name = "admission"
 harness = false
+
+# Extra credit (INC-5/INC-6): the loom model of the counter protocol lives in
+# tests/loom_model.rs and is gated on `--cfg loom`, so a normal build never pulls
+# loom in (it is not even in `cargo tree`). Run it with:
+#   RUSTFLAGS="--cfg loom" cargo test --release --test loom_model
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

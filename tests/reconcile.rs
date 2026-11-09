@@ -239,3 +239,38 @@ async fn reconcile_spanning_a_reload_never_touches_the_new_cluster() {
     drop(held);
     drop(on_b);
 }
+
+/// The brief's constraint for the bonus: `try_acquire` must not take an exclusive
+/// lock. `reconcile` now holds one (to serialize corrections), so prove the hot
+/// path is not blocked by it: a reconcile parked on a slow engine holds the
+/// per-cluster mutex for the whole time, and admissions keep working.
+#[tokio::test]
+async fn try_acquire_is_not_blocked_by_a_reconcile_holding_its_lock() {
+    let pool = pool(100);
+    let mut held: Vec<_> = (0..3).map(|_| pool.try_acquire("g").unwrap()).collect();
+
+    let (task, engine) = spawn_reconcile(&pool);
+    engine.started.await.unwrap(); // mutex held, fetch in flight
+
+    // Hot path still works while the exclusive lock is held. The reconcile
+    // snapshotted 3 before the fetch, so its answer is 3 and the delta is zero.
+    let admitted = tokio::time::timeout(Duration::from_secs(1), async {
+        for _ in 0..50 {
+            held.push(pool.try_acquire("g").unwrap());
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "try_acquire blocked behind the reconcile lock"
+    );
+    assert_eq!(pool.running("g", "a"), Some(53));
+
+    engine.answer.send(3).unwrap();
+    task.await.unwrap();
+    assert_eq!(
+        pool.running("g", "a"),
+        Some(53),
+        "the correction changed nothing"
+    );
+}
